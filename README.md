@@ -1,6 +1,6 @@
 # Website Time Tracker
 
-**Website Time Tracker** is a Chrome Extension (Manifest V3) that helps you understand how you spend your time online. See exactly where your attention goes and make smarter decisions about your browsing habits.d
+**Website Time Tracker** is a Chrome Extension (Manifest V3) that helps you understand how you spend your time online. See exactly where your attention goes and make smarter decisions about your browsing habits.
 
 Track time spent on each website, automatically categorize sites by tags (social, study, work, etc.), and view a clear daily breakdown with an interactive timeline and pie chart. 
 
