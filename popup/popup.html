@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=480, initial-scale=1">
+  <title>Website Time Tracker</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header class="header">
+    <h1 class="header-title">Website Time Tracker</h1>
+  </header>
+
+  <nav class="tabs">
+    <button type="button" class="tab active" data-tab="timeline" aria-selected="true">Timeline</button>
+    <button type="button" class="tab" data-tab="pie" aria-selected="false">Pie Chart</button>
+  </nav>
+
+  <main class="content">
+    <section id="timelinePanel" class="panel active" role="tabpanel">
+      <div class="timeline-scroll" id="timelineScroll">
+        <div class="timeline-placeholder" id="timelinePlaceholder">No activity recorded for this day.</div>
+        <div class="timeline-blocks" id="timelineBlocks"></div>
+      </div>
+    </section>
+
+    <section id="piePanel" class="panel" role="tabpanel" hidden>
+      <div class="pie-view-toggle">
+        <button type="button" class="toggle-btn active" id="pieToggleSites" data-pie-view="sites">By Site</button>
+        <button type="button" class="toggle-btn" id="pieToggleTags" data-pie-view="tags">By Tag</button>
+      </div>
+      <div class="pie-wrapper">
+        <canvas id="pieCanvas" width="280" height="280" aria-hidden="true"></canvas>
+        <div class="pie-legend" id="pieLegend"></div>
+      </div>
+      <div class="pie-placeholder" id="piePlaceholder">No data for this day.</div>
+    </section>
+  </main>
+
+  <section class="privacy">
+    <p><strong>Privacy:</strong> All data stays on your device. Nothing is sent to any server. Use Delete in Settings to clear data.</p>
+  </section>
+
+  <footer class="footer">
+    <div class="footer-row">
+      <label class="date-picker-label">
+        <span>Date</span>
+        <input type="date" id="datePicker" class="date-picker">
+      </label>
+    </div>
+    <div class="footer-actions">
+      <button type="button" id="btnDeleteDay" class="btn danger" title="Delete data for the selected day only">Delete this day</button>
+      <button type="button" id="btnSettings" class="btn secondary">Settings</button>
+    </div>
+  </footer>
+
+  <dialog id="settingsDialog" class="dialog">
+    <div class="dialog-inner">
+      <h2>Settings</h2>
+      <label class="field">
+        <span>Exclude domains (one per line)</span>
+        <textarea id="excludeDomains" rows="4" placeholder="e.g. youtube.com"></textarea>
+      </label>
+      <label class="field">
+        <span>Theme</span>
+        <select id="themeSelect" class="theme-select">
+          <option value="dark">Dark</option>
+          <option value="light">Light</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>Time granularity (ms)</span>
+        <input type="number" id="timeGranularity" min="1000" step="1000" value="1000">
+      </label>
+      <div class="field">
+        <span>Tags</span>
+        <p class="field-hint">Create tags (e.g. work, fun), then assign them to sites in the Timeline.</p>
+        <div class="tags-add-row">
+          <input type="text" id="newTagName" class="tags-input" placeholder="New tag name">
+          <button type="button" id="btnAddTag" class="btn secondary">Add</button>
+        </div>
+        <ul id="tagList" class="tag-list"></ul>
+      </div>
+      <div class="field settings-danger-zone">
+        <button type="button" id="btnDeleteAll" class="btn danger">Delete all data</button>
+        <p class="field-hint">Removes all usage data. Settings (tags, theme, etc.) are kept.</p>
+      </div>
+      <div class="dialog-actions">
+        <button type="button" id="settingsCancel" class="btn secondary">Cancel</button>
+        <button type="button" id="settingsSave" class="btn primary">Save</button>
+      </div>
+    </div>
+  </dialog>
+
+  <script src="popup.js"></script>
+</body>
+</html>

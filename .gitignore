@@ -1,0 +1,29 @@
+# Your entries
+.cursor
+.DS_Store
+
+# Dependencies
+node_modules/
+
+# Build / output
+dist/
+build/
+*.crx
+*.pem
+*.zip
+
+# Environment and secrets
+.env
+.env.*
+*.key
+
+# Logs and debug
+*.log
+npm-debug.log*
+
+# Editor and OS
+Thumbs.db
+*.swp
+*.swo
+.idea/
+*.sublime-*
