@@ -1,14 +1,16 @@
 # Website Time Tracker
 
-A **Chrome Extension (Manifest V3)** that tracks time spent per website (by domain) locally on your machine. Includes Incognito support with isolated data.
+**Website Time Tracker** helps you understand how you spend your time online. See exactly where your attention goes and make smarter decisions about your browsing habits.
+
+Track time spent on each website, automatically categorize sites by tags (social, study, work, etc.), and view a clear daily breakdown with an interactive timeline and pie chart. 
+
+All data stays on your device — no accounts, no cloud syncing, no external servers. Simple, private, and built to help you stay focused.
 
 ## Features
 
 - **Daily timeline** — Chronological breakdown of domain + duration
 - **Pie chart** — Percentage breakdown per domain (small domains grouped as “Other”)
 - **Privacy-first** — No backend; all data in `chrome.storage.local`
-- **Incognito** — Optional; data stays separate from normal browsing
-- **Export** — JSON or CSV
 - **Delete all data** — One-click clear
 - **Domain exclusion** — Exclude domains from tracking in Settings
 
@@ -16,7 +18,7 @@ A **Chrome Extension (Manifest V3)** that tracks time spent per website (by doma
 
 1. Clone or download this folder.
 2. Open Chrome → **Extensions** → **Manage extensions** → **Developer mode** (on).
-3. Click **Load unpacked** and select the `tracker` folder (the one containing `manifest.json`).
+3. Click **Load unpacked** and select this folder (the one containing `manifest.json`).
 4. (Optional) Right-click the extension → **Manage extension** → enable **Allow in Incognito**.
 
 ## Building / packaging
@@ -36,7 +38,7 @@ No build step required. The extension runs as-is. For store submission:
 
 ## Privacy
 
-See [PRIVACY.md](PRIVACY.md). All data stays on your device; nothing is sent to any server.
+See [PRIVACY.md](PRIVACY.md). All data stays on your device; nothing is sent anywhere.
 
 ## Testing
 
