@@ -450,6 +450,7 @@ document.getElementById('btnSettings').addEventListener('click', async () => {
   document.getElementById('excludeDomains').value = (settings.excludeDomains || []).join('\n');
   document.getElementById('timeGranularity').value = settings.timeGranularityMs ?? 1000;
   document.getElementById('themeSelect').value = (settings.theme === 'light' ? 'light' : 'dark');
+  document.getElementById('keepIncognitoData').checked = settings.keepIncognitoData === true;
   document.getElementById('newTagName').value = '';
   renderSettingsTagList(Array.isArray(tagList) ? tagList : []);
   settingsDialog.showModal();
@@ -501,9 +502,10 @@ document.getElementById('settingsSave').addEventListener('click', async () => {
   const excludeDomains = raw ? raw.split(/\n/).map(s => s.trim().toLowerCase()).filter(Boolean) : [];
   const timeGranularityMs = Math.max(1000, parseInt(document.getElementById('timeGranularity').value, 10) || 1000);
   const theme = document.getElementById('themeSelect').value === 'light' ? 'light' : 'dark';
+  const keepIncognitoData = document.getElementById('keepIncognitoData').checked;
   const { settings = {} } = await chrome.storage.local.get('settings');
   await chrome.storage.local.set({
-    settings: { ...settings, excludeDomains, timeGranularityMs, theme }
+    settings: { ...settings, excludeDomains, timeGranularityMs, theme, keepIncognitoData }
   });
   applyTheme(theme);
   settingsDialog.close();
