@@ -132,38 +132,8 @@ async function endSession(override) {
   day.timeline.push({ start, end: now, domain });
   await chrome.storage.local.set({ days, currentSession: null, _pendingSession: null });
 
-  // If keepIncognitoData is enabled, check if this session was incognito
-  // Use wasIncognito if available, otherwise check the tab directly or use window tracking
-  let shouldSync = false;
-  if (settings.keepIncognitoData) {
-    if (wasIncognito) {
-      shouldSync = true;
-    } else if (tabIdToCheck != null) {
-      // Fallback 1: check the tab directly if wasIncognito was cleared
-      try {
-        const tab = await chrome.tabs.get(tabIdToCheck).catch(() => null);
-        if (tab?.incognito) {
-          shouldSync = true;
-        } else if (tab?.windowId && incognitoWindowIds.has(tab.windowId)) {
-          // Fallback 2: check if the window is in our tracked incognito windows set
-          shouldSync = true;
-        }
-      } catch (err) {
-        // Tab might be closed, try window-based check
-        if (lastFocusedWindowId && incognitoWindowIds.has(lastFocusedWindowId)) {
-          shouldSync = true;
-        }
-      }
-    } else if (lastFocusedWindowId && incognitoWindowIds.has(lastFocusedWindowId)) {
-      // Fallback 4: if no tab ID but we have a tracked incognito window
-      shouldSync = true;
-    }
-  }
-
-  if (shouldSync) {
-    await writeToRegularStorage({ days, currentSession: null });
-  }
-  
+  // Do not call writeToRegularStorage here: the service worker has a single storage partition, so
+  // the write above already saved this session. Syncing would merge the same data again and double-count.
   pendingWrite = null;
 }
 
@@ -200,19 +170,11 @@ async function persistRunningTotal() {
   day.domains[lastDomain].ms += delta;
   lastPersistedAt = now;  // do not change lastStartTimestamp (needed for correct timeline block)
   await chrome.storage.local.set({ days });
-  
-  // If keepIncognitoData is enabled and we're in incognito, also write to regular storage
-  if (settings.keepIncognitoData) {
-    try {
-      const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (activeTab?.incognito) {
-        await writeToRegularStorage({ days });
-      }
-    } catch (err) {
-      // Ignore errors
-    }
-  }
-  
+
+  // Do not sync incognito→regular here: the alarm runs every ~30s, so we would merge the same
+  // cumulative incognito data repeatedly and multiply totals (~n× after n syncs). Sync only when
+  // we flush (endSession, onTabRemoved, onWindowRemoved).
+
   pendingWrite = null;
 }
 
@@ -434,18 +396,7 @@ async function onTabRemoved(tabId) {
   if (tabId === lastTabId) {
     const write = stopTracking();
     if (write) await write;
-    
-    // If this was an incognito tab and keepIncognitoData is enabled, sync data
-    if (wasIncognitoTab) {
-      const settings = await getSettings();
-      if (settings.keepIncognitoData) {
-        const incognitoData = await chrome.storage.local.get(['days', 'domainTags', 'tagList']);
-        if (incognitoData.days && Object.keys(incognitoData.days).length > 0) {
-          await writeToRegularStorage(incognitoData);
-        }
-      }
-    }
-    
+    // No writeToRegularStorage: service worker has one storage; stopTracking already wrote there.
     try {
       const win = await chrome.windows.getLastFocused();
       if (win?.id != null) {
@@ -469,16 +420,7 @@ chrome.windows.onRemoved.addListener(async (windowId) => {
       const write = stopTracking();
       if (write) await write;
     }
-    // Sync ALL data from incognito storage before it's cleared
-    const settings = await getSettings();
-    if (settings.keepIncognitoData) {
-      try {
-        const incognitoData = await chrome.storage.local.get(['days', 'domainTags', 'tagList']);
-        if (incognitoData.days && Object.keys(incognitoData.days).length > 0) {
-          await writeToRegularStorage(incognitoData);
-        }
-      } catch (err) {}
-    }
+    // No writeToRegularStorage: service worker has one storage; stopTracking already wrote there.
   }
 });
 chrome.windows.onFocusChanged.addListener(handleWindowFocus);
