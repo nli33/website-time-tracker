@@ -1,7 +1,9 @@
 /**
  * Website Time Tracker - Service Worker (MV3)
  * Tracks time per hostname when: tab active, window focused, user not idle.
- * All data in chrome.storage.local. Incognito uses split storage.
+ * All data in chrome.storage.local.
+ *
+ * State is centralized in TrackerState to reduce race conditions from async events.
  */
 
 const ALARM_PERSIST = 'persist';
@@ -9,16 +11,7 @@ const PERSIST_INTERVAL_MIN = 0.5;
 const IDLE_THRESHOLD_SEC = 60;
 const DEFAULT_GRANULARITY_MS = 1000;
 
-let lastDomain = null;
-let lastStartTimestamp = null;  // real session start (for timeline block)
-let lastPersistedAt = null;    // last time we wrote to storage (for incremental total only)
-let lastTabId = null;
-let lastTabIncognito = false;  // track if the tab being tracked is incognito
-let lastFocusedWindowId = null;
-let lastTrackedWindowId = null;  // window of the tab we're currently tracking (so we can end session when that window closes)
-let incognitoWindowIds = new Set();  // track which windows are incognito
-let isIdle = false;
-let pendingWrite = null;
+// ─── Pure utilities ─────────────────────────────────────────────────────────
 
 function getDateKey() {
   const d = new Date();
@@ -47,34 +40,6 @@ async function getSettings() {
   };
 }
 
-/**
- * Write data to regular storage when in incognito context and keepIncognitoData is enabled.
- * Uses chrome.storage.local.set() with a special key that will be picked up by storage.onChanged
- * listener in regular context, or directly merges if we can access regular storage.
- * 
- * Note: With split storage, chrome.storage.local in incognito context writes to incognito storage.
- * We use a workaround: write to a special key that the regular context can read and merge.
- */
-async function writeToRegularStorage(data) {
-  try {
-    // Try message-based sync first
-    await chrome.runtime.sendMessage({
-      type: 'SYNC_INCOGNITO_TO_REGULAR',
-      data: data
-    }).catch(() => {
-      // If message fails, use storage-based sync as fallback
-      // Write to a special key that indicates this should be synced
-      chrome.storage.local.set({
-        _incognitoSyncPending: {
-          timestamp: Date.now(),
-          data: data
-        }
-      }).catch(() => {});
-    });
-  } catch (err) {
-  }
-}
-
 function shouldTrack(hostname, excludeDomains) {
   if (!hostname) return false;
   return !excludeDomains.includes(hostname);
@@ -85,40 +50,72 @@ function roundMs(ms, granularityMs) {
   return Math.floor(ms / granularityMs) * granularityMs;
 }
 
-/**
- * End current session: write one timeline block (start → now) and update domain total.
- * Call on tab switch, tab close, window unfocus, idle. Clears in-memory state.
- * @param {{ domain?, start?, persistedAt?, tabIdToCheck?, wasIncognito? } | void} override - If provided (by stopTracking), use these so we don't rely on globals that may already be overwritten by another handler.
- */
+// ─── Centralized state (single source of truth) ──────────────────────────────
+
+class TrackerState {
+  constructor() {
+    this.session = null;       // { domain, start, persistedAt, tabId, windowId, wasIncognito }
+    this.focusedWindowId = null;
+    this.incognitoWindowIds = new Set();
+    this.isIdle = false;
+    this.pendingWrite = null;
+  }
+
+  hasSession() {
+    return this.session?.domain != null && this.session?.start != null;
+  }
+
+  /** Snapshot for endSession; safe to use after clearSession since we capture before clearing. */
+  snapshot() {
+    if (!this.session) return null;
+    return {
+      domain: this.session.domain,
+      start: this.session.start,
+      persistedAt: this.session.persistedAt,
+      tabIdToCheck: this.session.tabId,
+      wasIncognito: this.session.wasIncognito
+    };
+  }
+
+  clearSession() {
+    this.session = null;
+    this.pendingWrite = null;
+  }
+
+  reset() {
+    this.session = null;
+    this.focusedWindowId = null;
+    this.incognitoWindowIds.clear();
+    this.isIdle = false;
+    this.pendingWrite = null;
+  }
+}
+
+const state = new TrackerState();
+
+// ─── Session persistence (writes to storage) ────────────────────────────────
+
 async function endSession(override) {
   const useOverride = override && override.domain != null && override.start != null;
-  const domain = useOverride ? override.domain : lastDomain;
-  const start = useOverride ? override.start : lastStartTimestamp;
-  const persistedAt = useOverride ? override.persistedAt : lastPersistedAt;
-  const tabIdToCheck = useOverride && override.tabIdToCheck !== undefined ? override.tabIdToCheck : lastTabId;
-  const wasIncognito = useOverride && override.wasIncognito !== undefined ? override.wasIncognito : lastTabIncognito;
-  // Always clear once we've claimed this session so we don't double-end it (duplicate blocks) and so concurrent stopTracking() returns early.
+  const domain = useOverride ? override.domain : state.session?.domain;
+  const start = useOverride ? override.start : state.session?.start;
+  const persistedAt = useOverride ? override.persistedAt : state.session?.persistedAt;
+  const tabIdToCheck = useOverride && override.tabIdToCheck !== undefined ? override.tabIdToCheck : state.session?.tabId;
+  const wasIncognito = useOverride && override.wasIncognito !== undefined ? override.wasIncognito : state.session?.wasIncognito;
+
   if (domain != null && start != null) {
-    lastDomain = null;
-    lastStartTimestamp = null;
-    lastPersistedAt = null;
-    lastTabId = null;
-    lastTabIncognito = false;
-    lastTrackedWindowId = null;
+    state.clearSession();
   }
   if (domain == null || start == null) return;
 
   const settings = await getSettings();
   if (!shouldTrack(domain, settings.excludeDomains)) return;
 
-  // When "Keep incognito data" is off, do not persist incognito sessions to storage at all (so they never appear in the timeline).
   if (!settings.keepIncognitoData && wasIncognito) {
-    pendingWrite = null;
     return;
   }
 
   const now = Date.now();
-  // Only add time since last persist (rest was already added by persistRunningTotal)
   const increment = roundMs(now - (persistedAt ?? start), settings.timeGranularityMs);
 
   const key = getDateKey();
@@ -128,107 +125,100 @@ async function endSession(override) {
   const day = days[key];
   if (!day.domains[domain]) day.domains[domain] = { ms: 0 };
   if (increment > 0) day.domains[domain].ms += increment;
-  // Timeline block always uses full session duration (start → now)
   day.timeline.push({ start, end: now, domain });
   await chrome.storage.local.set({ days, currentSession: null, _pendingSession: null });
-
-  // Do not call writeToRegularStorage here: the service worker has a single storage partition, so
-  // the write above already saved this session. Syncing would merge the same data again and double-count.
-  pendingWrite = null;
 }
 
-/**
- * Persist running total only (no new timeline block). Call on periodic alarm.
- * Keeps domain total up to date so we don't lose time on crash; timeline block is written when session ends.
- */
 async function persistRunningTotal() {
-  if (lastDomain == null || lastStartTimestamp == null) return;
+  if (!state.hasSession()) return;
+  const s = state.session;
   const settings = await getSettings();
-  if (!shouldTrack(lastDomain, settings.excludeDomains)) {
-    lastDomain = null;
-    lastStartTimestamp = null;
-    lastPersistedAt = null;
-    lastTabId = null;
+  if (!shouldTrack(s.domain, settings.excludeDomains)) {
+    state.clearSession();
     await chrome.storage.local.set({ currentSession: null });
     return;
   }
-  // When "Keep incognito data" is off, do not persist incognito session time to storage.
-  if (!settings.keepIncognitoData && lastTabIncognito) return;
+  if (!settings.keepIncognitoData && s.wasIncognito) return;
+
   const now = Date.now();
-  const from = lastPersistedAt ?? lastStartTimestamp;
+  const from = s.persistedAt ?? s.start;
   const delta = roundMs(now - from, settings.timeGranularityMs);
   if (delta <= 0) {
-    lastPersistedAt = now;
+    s.persistedAt = now;
     return;
   }
+
   const key = getDateKey();
   const data = await chrome.storage.local.get({ days: {} });
   const days = data.days || {};
   if (!days[key]) days[key] = { domains: {}, timeline: [] };
   const day = days[key];
-  if (!day.domains[lastDomain]) day.domains[lastDomain] = { ms: 0 };
-  day.domains[lastDomain].ms += delta;
-  lastPersistedAt = now;  // do not change lastStartTimestamp (needed for correct timeline block)
+  if (!day.domains[s.domain]) day.domains[s.domain] = { ms: 0 };
+  day.domains[s.domain].ms += delta;
+  s.persistedAt = now;
   await chrome.storage.local.set({ days });
-
-  // Do not sync incognito→regular here: the alarm runs every ~30s, so we would merge the same
-  // cumulative incognito data repeatedly and multiply totals (~n× after n syncs). Sync only when
-  // we flush (endSession, onTabRemoved, onWindowRemoved).
-
-  pendingWrite = null;
+  state.pendingWrite = null;
 }
 
+// ─── Tracker actions (centralized entry points) ───────────────────────────────
+
 function stopTracking() {
-  if (lastDomain == null || lastStartTimestamp == null) return null;
-  if (pendingWrite) return pendingWrite;
-  // Capture full session at invoke time so endSession uses it even if another handler overwrites globals before endSession runs.
-  const sessionOverride = {
-    domain: lastDomain,
-    start: lastStartTimestamp,
-    persistedAt: lastPersistedAt,
-    tabIdToCheck: lastTabId,
-    wasIncognito: lastTabIncognito
-  };
-  pendingWrite = endSession(sessionOverride);
-  pendingWrite.finally(() => { pendingWrite = null; });
-  return pendingWrite;
+  if (!state.hasSession()) return null;
+  if (state.pendingWrite) return state.pendingWrite;
+
+  const snapshot = state.snapshot();
+  state.clearSession();
+
+  const promise = endSession(snapshot);
+  state.pendingWrite = promise;
+  promise.finally(() => { state.pendingWrite = null; });
+  return promise;
 }
 
 async function startTracking(hostname, tabId) {
   const settings = await getSettings();
   if (!shouldTrack(hostname, settings.excludeDomains)) return;
-  lastDomain = hostname;
+
   const now = Date.now();
-  lastStartTimestamp = now;
-  lastPersistedAt = now;
-  lastTabId = tabId ?? null;
-  // Track if this tab is incognito and track its window
+  let windowId = null;
+  let wasIncognito = false;
+
   if (tabId != null) {
     try {
       const tab = await chrome.tabs.get(tabId).catch(() => null);
-      lastTabIncognito = tab?.incognito ?? false;
-      lastTrackedWindowId = tab?.windowId ?? null;
+      wasIncognito = tab?.incognito ?? false;
+      windowId = tab?.windowId ?? null;
       if (tab?.incognito && tab?.windowId) {
-        incognitoWindowIds.add(tab.windowId);
+        state.incognitoWindowIds.add(tab.windowId);
       }
-    } catch (err) {
-      lastTabIncognito = false;
+    } catch {
+      wasIncognito = false;
     }
-  } else {
-    lastTabIncognito = false;
   }
+
+  state.session = {
+    domain: hostname,
+    start: now,
+    persistedAt: now,
+    tabId: tabId ?? null,
+    windowId,
+    wasIncognito
+  };
+
   const pendingSession = {
     domain: hostname,
     start: now,
     persistedAt: now,
-    windowId: lastTrackedWindowId ?? undefined,
-    wasIncognito: lastTabIncognito
+    windowId: windowId ?? undefined,
+    wasIncognito
   };
   await chrome.storage.local.set({
     currentSession: { domain: hostname, start: now },
     _pendingSession: pendingSession
   });
 }
+
+// ─── Event handlers ──────────────────────────────────────────────────────────
 
 async function ensureAlarm() {
   const existing = await chrome.alarms.get(ALARM_PERSIST);
@@ -238,14 +228,13 @@ async function ensureAlarm() {
 }
 
 async function handleActiveTab(tabId, windowId) {
-  // Recover from durable pending session only when that window is gone (last incognito closed); avoids writing stale pending from a previous run/SW restart
-  if (lastTabId == null && lastDomain == null) {
+  // Recover from durable pending session when window is gone (SW restart / last incognito closed)
+  if (!state.hasSession()) {
     const stored = await chrome.storage.local.get({ _pendingSession: null });
     const pending = stored._pendingSession;
     if (pending?.domain != null && pending?.start != null && pending?.windowId != null && pending.windowId !== windowId) {
       const pendingWindowGone = await chrome.windows.get(pending.windowId).then(() => false, () => true);
       if (pendingWindowGone) {
-        // Treat undefined wasIncognito as incognito so we don't persist when "Keep incognito data" is off (avoids one stray block from recovered pending).
         await endSession({
           domain: pending.domain,
           start: pending.start,
@@ -254,41 +243,46 @@ async function handleActiveTab(tabId, windowId) {
           wasIncognito: pending.wasIncognito !== false
         });
         await chrome.storage.local.set({ _pendingSession: null });
-        lastFocusedWindowId = windowId;
+        state.focusedWindowId = windowId;
       }
     }
   }
-  // End session when switching to a different window (focus may have already moved, so also check lastTrackedWindowId)
-  if (windowId !== lastFocusedWindowId) {
+
+  // End session when switching to a different window
+  if (windowId !== state.focusedWindowId) {
     const w = stopTracking();
     if (w) await w;
-    lastFocusedWindowId = windowId;
-  } else if (lastDomain != null && lastTrackedWindowId != null && windowId !== lastTrackedWindowId) {
-    // Same "focused" window id but we're tracking a session in another window (e.g. incognito closed, focus already moved) — end that session
+    state.focusedWindowId = windowId;
+  } else if (state.hasSession() && state.session.windowId != null && windowId !== state.session.windowId) {
     const w = stopTracking();
     if (w) await w;
-    lastFocusedWindowId = windowId;
+    state.focusedWindowId = windowId;
   }
+
   if (tabId == null) return;
+
   try {
     const tab = await chrome.tabs.get(tabId);
     const hostname = hostnameFromUrl(tab?.url);
     const url = tab?.url || '';
     const tabStillLoading = !url || url === 'about:blank';
-    if (tabId !== lastTabId && lastDomain != null && (hostname === lastDomain || (hostname == null && tabStillLoading))) {
-      lastTabId = tabId;
+
+    if (tabId !== state.session?.tabId && state.hasSession() &&
+        (hostname === state.session.domain || (hostname == null && tabStillLoading))) {
+      state.session.tabId = tabId;
       return;
     }
-    if (tabId !== lastTabId) {
+
+    if (tabId !== state.session?.tabId) {
       const w = stopTracking();
       if (w) await w;
     }
-    if (hostname && lastFocusedWindowId === windowId) {
+
+    if (hostname && state.focusedWindowId === windowId) {
       await startTracking(hostname, tabId);
     } else {
       const w = stopTracking();
       if (w) await w;
-      // Clear currentSession so the UI doesn't show a stale "live" session (e.g. after closing incognito and landing on chrome://extensions)
       if (!hostname) await chrome.storage.local.set({ currentSession: null });
     }
   } catch {
@@ -301,15 +295,18 @@ async function handleActiveTab(tabId, windowId) {
 async function handleWindowFocus(windowId) {
   if (windowId === chrome.windows.WINDOW_ID_NONE) {
     stopTracking();
-    lastFocusedWindowId = null;
+    state.focusedWindowId = null;
     return;
   }
-  const wasFocused = lastFocusedWindowId;
-  lastFocusedWindowId = windowId;
+
+  const wasFocused = state.focusedWindowId;
+  state.focusedWindowId = windowId;
+
   if (wasFocused !== windowId) {
     const w = stopTracking();
     if (w) await w;
   }
+
   try {
     const [tab] = await chrome.tabs.query({ active: true, windowId });
     if (tab) await handleActiveTab(tab.id, windowId);
@@ -318,17 +315,17 @@ async function handleWindowFocus(windowId) {
   }
 }
 
-async function onIdleStateChange(state) {
-  const nowIdle = state !== 'active';
-  if (nowIdle && !isIdle) {
-    isIdle = true;
+async function onIdleStateChange(idleState) {
+  const nowIdle = idleState !== 'active';
+  if (nowIdle && !state.isIdle) {
+    state.isIdle = true;
     stopTracking();
-  } else if (!nowIdle && isIdle) {
-    isIdle = false;
+  } else if (!nowIdle && state.isIdle) {
+    state.isIdle = false;
     try {
       const win = await chrome.windows.getLastFocused();
       if (win?.id != null) {
-        lastFocusedWindowId = win.id;
+        state.focusedWindowId = win.id;
         const [tab] = await chrome.tabs.query({ active: true, windowId: win.id });
         if (tab) await handleActiveTab(tab.id, win.id);
       }
@@ -337,10 +334,10 @@ async function onIdleStateChange(state) {
 }
 
 async function onTabActivated(activeInfo) {
-  if (activeInfo.windowId !== lastFocusedWindowId) {
+  if (activeInfo.windowId !== state.focusedWindowId) {
     const w = stopTracking();
     if (w) await w;
-    lastFocusedWindowId = activeInfo.windowId;
+    state.focusedWindowId = activeInfo.windowId;
   }
   await handleActiveTab(activeInfo.tabId, activeInfo.windowId);
 }
@@ -349,37 +346,38 @@ async function onTabUpdated(tabId, changeInfo, tab) {
   if (changeInfo.url === undefined) return;
   const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!active || active.id !== tabId) return;
-  if (active.windowId !== lastFocusedWindowId) return;
+  if (active.windowId !== state.focusedWindowId) return;
+
   const url = tab?.url || changeInfo.url;
   const hostname = hostnameFromUrl(url);
   if (!hostname) {
     stopTracking();
     return;
   }
-  if (hostname === lastDomain && tabId === lastTabId) return;
+  if (hostname === state.session?.domain && tabId === state.session?.tabId) return;
+
   const w = stopTracking();
   if (w) await w;
   await startTracking(hostname, tabId);
 }
 
-/** If the active tab/window doesn't match our state, end session and sync to current tab. */
 async function reconcileWithCurrentTab() {
-  if (lastDomain == null) return;
+  if (!state.hasSession()) return;
   try {
     const win = await chrome.windows.getLastFocused();
-    if (win?.id != null && win.id !== lastFocusedWindowId) {
+    if (win?.id != null && win.id !== state.focusedWindowId) {
       const w = stopTracking();
       if (w) await w;
-      lastFocusedWindowId = win.id;
+      state.focusedWindowId = win.id;
       const [tab] = await chrome.tabs.query({ active: true, windowId: win.id });
       if (tab) await handleActiveTab(tab.id, win.id);
       return;
     }
-    const [tab] = await chrome.tabs.query({ active: true, windowId: lastFocusedWindowId });
-    if (!tab || tab.id !== lastTabId) {
+    const [tab] = await chrome.tabs.query({ active: true, windowId: state.focusedWindowId });
+    if (!tab || tab.id !== state.session?.tabId) {
       const w = stopTracking();
       if (w) await w;
-      if (tab) await handleActiveTab(tab.id, lastFocusedWindowId);
+      if (tab) await handleActiveTab(tab.id, state.focusedWindowId);
     }
   } catch {
     stopTracking();
@@ -387,42 +385,38 @@ async function reconcileWithCurrentTab() {
 }
 
 async function onTabRemoved(tabId) {
-  // Check if this tab was incognito before it's removed
-  let wasIncognitoTab = false;
+  if (tabId !== state.session?.tabId) return;
+
+  const write = stopTracking();
+  if (write) await write;
+
   try {
-    const tab = await chrome.tabs.get(tabId).catch(() => null);
-    wasIncognitoTab = tab?.incognito ?? false;
+    const win = await chrome.windows.getLastFocused();
+    if (win?.id != null) {
+      state.focusedWindowId = win.id;
+      const [tab] = await chrome.tabs.query({ active: true, windowId: win.id });
+      if (tab) await handleActiveTab(tab.id, win.id);
+    }
   } catch {}
-  if (tabId === lastTabId) {
-    const write = stopTracking();
-    if (write) await write;
-    // No writeToRegularStorage: service worker has one storage; stopTracking already wrote there.
-    try {
-      const win = await chrome.windows.getLastFocused();
-      if (win?.id != null) {
-        lastFocusedWindowId = win.id;
-        const [tab] = await chrome.tabs.query({ active: true, windowId: win.id });
-        if (tab) await handleActiveTab(tab.id, win.id);
-      }
-    } catch {}
-  }
 }
+
+// ─── Listener registration ──────────────────────────────────────────────────
 
 chrome.tabs.onActivated.addListener(onTabActivated);
 chrome.tabs.onUpdated.addListener(onTabUpdated);
 chrome.tabs.onRemoved.addListener(onTabRemoved);
+
 chrome.windows.onRemoved.addListener(async (windowId) => {
-  // Check if this is a tracked incognito window (we track these when we start tracking tabs in them)
-  if (incognitoWindowIds.has(windowId)) {
-    incognitoWindowIds.delete(windowId);
-    // End current session if it belonged to this window (focus may have already moved, so check lastTrackedWindowId too)
-    if (lastDomain != null && (windowId === lastFocusedWindowId || windowId === lastTrackedWindowId)) {
+  if (state.incognitoWindowIds.has(windowId)) {
+    state.incognitoWindowIds.delete(windowId);
+    if (state.hasSession() &&
+        (windowId === state.focusedWindowId || windowId === state.session.windowId)) {
       const write = stopTracking();
       if (write) await write;
     }
-    // No writeToRegularStorage: service worker has one storage; stopTracking already wrote there.
   }
 });
+
 chrome.windows.onFocusChanged.addListener(handleWindowFocus);
 chrome.idle.onStateChanged.addListener(onIdleStateChange);
 
@@ -432,18 +426,18 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   await reconcileWithCurrentTab();
 });
 
-// Storage change listener to handle incognito sync via storage bridge
+// ─── Storage sync (incognito bridge – kept for compatibility; service worker uses single partition) ───
+
 let lastProcessedSyncTimestamp = 0;
 chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName === 'local' && changes._incognitoSyncPending?.newValue) {
     const syncMarker = changes._incognitoSyncPending.newValue;
     const syncData = syncMarker.data;
     const syncTimestamp = syncMarker.timestamp || 0;
-    
-    // Deduplicate: only process if this is a new sync (different timestamp)
+
     if (syncTimestamp <= lastProcessedSyncTimestamp) return;
     lastProcessedSyncTimestamp = syncTimestamp;
-    // Merge incognito data into regular storage (this runs in regular context)
+
     (async () => {
       try {
         const { days: incognitoDays, domainTags: incognitoDomainTags, tagList: incognitoTagList } = syncData;
@@ -451,57 +445,42 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
         const regularDays = regularData.days || {};
         const regularDomainTags = regularData.domainTags || {};
         const regularTagList = regularData.tagList || [];
-        
-        // Merge days
+
         if (incognitoDays) {
           for (const [dateKey, incognitoDay] of Object.entries(incognitoDays)) {
-            if (!regularDays[dateKey]) {
-              regularDays[dateKey] = { domains: {}, timeline: [] };
-            }
+            if (!regularDays[dateKey]) regularDays[dateKey] = { domains: {}, timeline: [] };
             const regularDay = regularDays[dateKey];
-            
-            // Merge domains
+
             for (const [domain, incognitoDomainData] of Object.entries(incognitoDay.domains || {})) {
-              if (!regularDay.domains[domain]) {
-                regularDay.domains[domain] = { ms: 0 };
-              }
+              if (!regularDay.domains[domain]) regularDay.domains[domain] = { ms: 0 };
               regularDay.domains[domain].ms = (regularDay.domains[domain].ms || 0) + (incognitoDomainData.ms || 0);
             }
-            
-            // Merge timeline blocks (deduplicate by start/end/domain)
+
             if (incognitoDay.timeline) {
               const existingBlocks = new Map();
               (regularDay.timeline || []).forEach(block => {
-                const key = `${block.start}-${block.end}-${block.domain}`;
-                existingBlocks.set(key, block);
+                existingBlocks.set(`${block.start}-${block.end}-${block.domain}`, block);
               });
               incognitoDay.timeline.forEach(block => {
                 const key = `${block.start}-${block.end}-${block.domain}`;
-                if (!existingBlocks.has(key)) {
-                  existingBlocks.set(key, block);
-                }
+                if (!existingBlocks.has(key)) existingBlocks.set(key, block);
               });
               regularDay.timeline = Array.from(existingBlocks.values()).sort((a, b) => (a.start || 0) - (b.start || 0));
             }
           }
         }
-        
-        // Merge domain tags
-        if (incognitoDomainTags) {
-          Object.assign(regularDomainTags, incognitoDomainTags);
-        }
-        
-        // Merge tag list
+
+        if (incognitoDomainTags) Object.assign(regularDomainTags, incognitoDomainTags);
+
         if (incognitoTagList && Array.isArray(incognitoTagList)) {
           const tagSet = new Set(regularTagList);
           incognitoTagList.forEach(tag => tagSet.add(tag));
           const mergedTagList = Array.from(tagSet).sort();
-          
           await chrome.storage.local.set({
             days: regularDays,
             domainTags: regularDomainTags,
             tagList: mergedTagList,
-            _incognitoSyncPending: null // Clear the sync marker
+            _incognitoSyncPending: null
           });
         } else {
           await chrome.storage.local.set({
@@ -510,99 +489,66 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
             _incognitoSyncPending: null
           });
         }
-      } catch (err) {}
+      } catch {}
     })();
   }
 });
 
-// Message handler to sync incognito data to regular storage
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'SYNC_INCOGNITO_TO_REGULAR') {
-    // This handler should run in regular context and write to regular storage
     (async () => {
       try {
-        // Verify we're not in incognito context by checking if sender is incognito
-        // If sender is incognito, this handler should write to regular storage
-        // (chrome.storage.local in regular context writes to regular storage)
-        const { days: incognitoDays, currentSession: incognitoSession, domainTags: incognitoDomainTags, tagList: incognitoTagList } = message.data;
-        
-        // Get current regular storage
+        const { days: incognitoDays, domainTags: incognitoDomainTags, tagList: incognitoTagList } = message.data;
         const regularData = await chrome.storage.local.get(['days', 'domainTags', 'tagList']);
         const regularDays = regularData.days || {};
         const regularDomainTags = regularData.domainTags || {};
         const regularTagList = regularData.tagList || [];
-        
-        // Merge incognito days into regular days
+
         if (incognitoDays) {
           for (const [dateKey, incognitoDay] of Object.entries(incognitoDays)) {
-            if (!regularDays[dateKey]) {
-              regularDays[dateKey] = { domains: {}, timeline: [] };
-            }
+            if (!regularDays[dateKey]) regularDays[dateKey] = { domains: {}, timeline: [] };
             const regularDay = regularDays[dateKey];
-            
-            // Merge domains
+
             for (const [domain, incognitoDomainData] of Object.entries(incognitoDay.domains || {})) {
-              if (!regularDay.domains[domain]) {
-                regularDay.domains[domain] = { ms: 0 };
-              }
+              if (!regularDay.domains[domain]) regularDay.domains[domain] = { ms: 0 };
               regularDay.domains[domain].ms = (regularDay.domains[domain].ms || 0) + (incognitoDomainData.ms || 0);
             }
-            
-            // Merge timeline blocks
+
             if (incognitoDay.timeline) {
               regularDay.timeline = (regularDay.timeline || []).concat(incognitoDay.timeline);
-              // Sort timeline by start time
               regularDay.timeline.sort((a, b) => (a.start || 0) - (b.start || 0));
             }
           }
         }
-        
-        // Merge domain tags (incognito tags take precedence for same domain)
-        if (incognitoDomainTags) {
-          Object.assign(regularDomainTags, incognitoDomainTags);
-        }
-        
-        // Merge tag list (union, keep unique)
+
+        if (incognitoDomainTags) Object.assign(regularDomainTags, incognitoDomainTags);
+
         if (incognitoTagList && Array.isArray(incognitoTagList)) {
           const tagSet = new Set(regularTagList);
           incognitoTagList.forEach(tag => tagSet.add(tag));
           const mergedTagList = Array.from(tagSet).sort();
-          
-          await chrome.storage.local.set({
-            days: regularDays,
-            domainTags: regularDomainTags,
-            tagList: mergedTagList
-          });
+          await chrome.storage.local.set({ days: regularDays, domainTags: regularDomainTags, tagList: mergedTagList });
         } else {
-          await chrome.storage.local.set({
-            days: regularDays,
-            domainTags: regularDomainTags
-          });
+          await chrome.storage.local.set({ days: regularDays, domainTags: regularDomainTags });
         }
       } catch (err) {
         console.error('Error syncing incognito data to regular storage:', err);
       }
     })();
-    return true; // Keep message channel open for async response
+    return true;
   }
 });
 
+// ─── Startup / install ──────────────────────────────────────────────────────
+
 chrome.runtime.onStartup.addListener(async () => {
-  lastDomain = null;
-  lastStartTimestamp = null;
-  lastPersistedAt = null;
-  lastTabId = null;
-  lastTabIncognito = false;
-  lastFocusedWindowId = null;
-  incognitoWindowIds.clear();
-  isIdle = false;
-  pendingWrite = null;
+  state.reset();
   await chrome.storage.local.set({ currentSession: null });
   await ensureAlarm();
   try {
     const win = await chrome.windows.getLastFocused();
     if (win?.id != null) {
-      lastFocusedWindowId = win.id;
+      state.focusedWindowId = win.id;
       const [tab] = await chrome.tabs.query({ active: true, windowId: win.id });
       if (tab) await handleActiveTab(tab.id, win.id);
     }
@@ -619,10 +565,11 @@ chrome.runtime.onInstalled.addListener(async () => {
   if (!Array.isArray(data.tagList) || data.tagList.length === 0) updates.tagList = ['Social', 'Study', 'Work'];
   if (!data.domainTags || typeof data.domainTags !== 'object') updates.domainTags = {};
   if (Object.keys(updates).length) await chrome.storage.local.set(updates);
+
   try {
     const win = await chrome.windows.getLastFocused();
     if (win?.id != null) {
-      lastFocusedWindowId = win.id;
+      state.focusedWindowId = win.id;
       const [tab] = await chrome.tabs.query({ active: true, windowId: win.id });
       if (tab) {
         const hostname = hostnameFromUrl(tab.url);
