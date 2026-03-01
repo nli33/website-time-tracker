@@ -1,6 +1,7 @@
 # Your entries
 .cursor
 .DS_Store
+icons/old/
 
 # Dependencies
 node_modules/
